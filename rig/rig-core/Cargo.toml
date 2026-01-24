@@ -61,7 +61,7 @@ reqwest-middleware = { version = "0.4.2", optional = true, features = [
 ] }
 
 # WASIP2 async support (component model)
-wit-bindgen = { version = "0.50", features = [
+wit-bindgen = { version = "0.51", features = [
   "async",
   "async-spawn",
 ], optional = true }

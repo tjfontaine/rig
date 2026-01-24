@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
-use futures::{StreamExt, TryStreamExt, channel::oneshot::Canceled, stream};
-use tokio::sync::{
-    RwLock,
-    mpsc::{Sender, error::SendError},
+use futures::{
+    channel::{
+        mpsc::{self, TrySendError, UnboundedSender},
+        oneshot::Canceled,
+    },
+    stream, StreamExt, TryStreamExt,
 };
+use tokio::sync::RwLock;
 
 use crate::{
     completion::{CompletionError, ToolDefinition},
     tool::{Tool, ToolDyn, ToolError, ToolSet, ToolSetError},
-    vector_store::{VectorSearchRequest, VectorStoreError, VectorStoreIndexDyn, request::Filter},
+    vector_store::{request::Filter, VectorSearchRequest, VectorStoreError, VectorStoreIndexDyn},
 };
 
 pub struct ToolServer {
@@ -106,26 +109,44 @@ impl ToolServer {
         self
     }
 
+    /// Run the tool server.
+    ///
+    /// For WASIP2: Creates a synchronous handle that accesses tools directly
+    /// (spawned tasks don't work because main thread is blocked polling streams).
+    ///
+    /// For other platforms: Uses the channel+spawn pattern with async message handling.
+    #[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+    pub fn run(self) -> ToolServerHandle {
+        use crate::wasm_compat::WasmRwLock;
+        use std::sync::Arc;
+
+        // For WASIP2, store the toolset directly in the handle
+        // This avoids the channel+spawn pattern that doesn't work with JSPI
+        let inner = WasipToolServerInner {
+            static_tool_names: self.static_tool_names,
+            dynamic_tools: self.dynamic_tools,
+            toolset: self.toolset,
+        };
+
+        ToolServerHandle {
+            inner: Arc::new(WasmRwLock::new(inner)),
+        }
+    }
+
+    #[cfg(not(all(feature = "wasip2", target_arch = "wasm32")))]
     pub fn run(mut self) -> ToolServerHandle {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1000);
+        // Use unbounded channel - UnboundedSender::unbounded_send takes &self
+        let (tx, mut rx) = mpsc::unbounded();
 
-        #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
-        tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
+        // Use the unified spawn abstraction that routes to the appropriate runtime
+        // (tokio::spawn for native, wasm-bindgen-futures for wasm, wit-bindgen for wasip2)
+        crate::spawn(async move {
+            while let Some(message) = rx.next().await {
                 self.handle_message(message).await;
             }
         });
 
-        // SAFETY: `rig` currently doesn't compile to WASM without the `worker` feature.
-        // Therefore, we can safely assume that the user won't try to compile to wasm without the worker feature.
-        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-        wasm_bindgen_futures::spawn_local(async move {
-            while let Some(message) = rx.recv().await {
-                self.handle_message(message).await;
-            }
-        });
-
-        ToolServerHandle(tx)
+        ToolServerHandle { sender: tx }
     }
 
     pub async fn handle_message(&mut self, message: ToolServerRequest) {
@@ -256,21 +277,117 @@ impl ToolServer {
     }
 }
 
-#[derive(Clone)]
-pub struct ToolServerHandle(Sender<ToolServerRequest>);
+/// Inner data for WASIP2 synchronous tool server
+/// Stores tools directly without channel indirection
+#[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+pub struct WasipToolServerInner {
+    static_tool_names: Vec<String>,
+    dynamic_tools: Vec<(usize, Box<dyn VectorStoreIndexDyn + Send + Sync>)>,
+    toolset: ToolSet,
+}
 
+#[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+impl WasipToolServerInner {
+    pub async fn get_tool_definitions(
+        &mut self,
+        text: Option<String>,
+    ) -> Result<Vec<ToolDefinition>, CompletionError> {
+        let static_tool_names = self.static_tool_names.clone();
+        let mut tools = Vec::new();
+
+        // For WASIP2, skip dynamic tools iteration (requires async streams)
+        // Just return static tools synchronously
+        if text.is_some() {
+            // We have RAG text but can't do async vector search in WASIP2
+            // Just fall through to static tools
+        }
+
+        for toolname in static_tool_names {
+            if let Some(tool) = self.toolset.get(&toolname) {
+                tools.push(tool.definition(text.clone().unwrap_or_default()).await)
+            } else {
+                tracing::warn!("Tool implementation not found in toolset: {}", toolname);
+            }
+        }
+
+        Ok(tools)
+    }
+}
+
+/// WASIP2: Synchronous handle that stores tools directly (no channels)
+#[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct ToolServerHandle {
+    inner: std::sync::Arc<crate::wasm_compat::WasmRwLock<WasipToolServerInner>>,
+}
+
+/// Native/WASM: Channel-based handle that sends messages to spawned task
+#[cfg(not(all(feature = "wasip2", target_arch = "wasm32")))]
+#[derive(Clone)]
+pub struct ToolServerHandle {
+    sender: UnboundedSender<ToolServerRequest>,
+}
+
+/// WASIP2: Synchronous implementations using direct state access
+#[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+impl ToolServerHandle {
+    pub async fn add_tool(&self, tool: impl ToolDyn + 'static) -> Result<(), ToolServerError> {
+        let mut guard = self.inner.write().await;
+        let name = tool.name();
+        guard.toolset.add_tool_boxed(Box::new(tool));
+        guard.static_tool_names.push(name);
+        Ok(())
+    }
+
+    pub async fn append_toolset(&self, toolset: ToolSet) -> Result<(), ToolServerError> {
+        let mut guard = self.inner.write().await;
+        // Extract tool names before adding
+        let names: Vec<String> = toolset.tool_names().collect();
+        guard.toolset.add_tools(toolset);
+        guard.static_tool_names.extend(names);
+        Ok(())
+    }
+
+    pub async fn remove_tool(&self, tool_name: &str) -> Result<(), ToolServerError> {
+        let mut guard = self.inner.write().await;
+        guard.static_tool_names.retain(|x| x != tool_name);
+        guard.toolset.delete_tool(tool_name);
+        Ok(())
+    }
+
+    pub async fn call_tool(&self, tool_name: &str, args: &str) -> Result<String, ToolServerError> {
+        let mut guard = self.inner.write().await;
+        match guard.toolset.call(tool_name, args.to_string()).await {
+            Ok(result) => Ok(result),
+            Err(err) => Err(ToolServerError::ToolsetError(err)),
+        }
+    }
+
+    pub async fn get_tool_defs(
+        &self,
+        prompt: Option<String>,
+    ) -> Result<Vec<ToolDefinition>, ToolServerError> {
+        let mut guard = self.inner.write().await;
+        guard.get_tool_definitions(prompt).await.map_err(|e| {
+            ToolServerError::ToolsetError(ToolSetError::ToolCallError(ToolError::ToolCallError(
+                e.to_string().into(),
+            )))
+        })
+    }
+}
+
+/// Native/WASM: Channel-based implementations
+#[cfg(not(all(feature = "wasip2", target_arch = "wasm32")))]
 impl ToolServerHandle {
     pub async fn add_tool(&self, tool: impl ToolDyn + 'static) -> Result<(), ToolServerError> {
         let tool = Box::new(tool);
 
         let (tx, rx) = futures::channel::oneshot::channel();
 
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::AddTool(tool),
-            })
-            .await?;
+        self.sender.unbounded_send(ToolServerRequest {
+            callback_channel: tx,
+            data: ToolServerRequestMessageKind::AddTool(tool),
+        })?;
 
         let res = rx.await?;
 
@@ -284,12 +401,10 @@ impl ToolServerHandle {
     pub async fn append_toolset(&self, toolset: ToolSet) -> Result<(), ToolServerError> {
         let (tx, rx) = futures::channel::oneshot::channel();
 
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::AppendToolset(toolset),
-            })
-            .await?;
+        self.sender.unbounded_send(ToolServerRequest {
+            callback_channel: tx,
+            data: ToolServerRequestMessageKind::AppendToolset(toolset),
+        })?;
 
         let res = rx.await?;
 
@@ -303,14 +418,12 @@ impl ToolServerHandle {
     pub async fn remove_tool(&self, tool_name: &str) -> Result<(), ToolServerError> {
         let (tx, rx) = futures::channel::oneshot::channel();
 
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::RemoveTool {
-                    tool_name: tool_name.to_string(),
-                },
-            })
-            .await?;
+        self.sender.unbounded_send(ToolServerRequest {
+            callback_channel: tx,
+            data: ToolServerRequestMessageKind::RemoveTool {
+                tool_name: tool_name.to_string(),
+            },
+        })?;
 
         let res = rx.await?;
 
@@ -324,15 +437,13 @@ impl ToolServerHandle {
     pub async fn call_tool(&self, tool_name: &str, args: &str) -> Result<String, ToolServerError> {
         let (tx, rx) = futures::channel::oneshot::channel();
 
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::CallTool {
-                    name: tool_name.to_string(),
-                    args: args.to_string(),
-                },
-            })
-            .await?;
+        self.sender.unbounded_send(ToolServerRequest {
+            callback_channel: tx,
+            data: ToolServerRequestMessageKind::CallTool {
+                name: tool_name.to_string(),
+                args: args.to_string(),
+            },
+        })?;
 
         let res = rx.await?;
 
@@ -351,12 +462,10 @@ impl ToolServerHandle {
     ) -> Result<Vec<ToolDefinition>, ToolServerError> {
         let (tx, rx) = futures::channel::oneshot::channel();
 
-        self.0
-            .send(ToolServerRequest {
-                callback_channel: tx,
-                data: ToolServerRequestMessageKind::GetToolDefs { prompt },
-            })
-            .await?;
+        self.sender.unbounded_send(ToolServerRequest {
+            callback_channel: tx,
+            data: ToolServerRequestMessageKind::GetToolDefs { prompt },
+        })?;
 
         let res = rx.await?;
 
@@ -397,7 +506,7 @@ pub enum ToolServerError {
     #[error("Toolset error: {0}")]
     ToolsetError(#[from] ToolSetError),
     #[error("Error while sending message: {0}")]
-    SendError(#[from] SendError<ToolServerRequest>),
+    SendError(#[from] TrySendError<ToolServerRequest>),
     #[error("An invalid message type was returned")]
     InvalidMessage(ToolServerResponse),
 }
@@ -411,10 +520,10 @@ mod tests {
 
     use crate::{
         completion::ToolDefinition,
-        tool::{Tool, ToolSet, server::ToolServer},
+        tool::{server::ToolServer, Tool, ToolSet},
         vector_store::{
-            VectorStoreError, VectorStoreIndex,
             request::{Filter, VectorSearchRequest},
+            VectorStoreError, VectorStoreIndex,
         },
         wasm_compat::WasmCompatSend,
     };

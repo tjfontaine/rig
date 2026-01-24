@@ -479,6 +479,11 @@ impl ToolSet {
         self.tools.get(toolname)
     }
 
+    /// Get an iterator over tool names in this set
+    pub fn tool_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.tools.keys().cloned()
+    }
+
     pub async fn get_tool_definitions(&self) -> Result<Vec<ToolDefinition>, ToolSetError> {
         let mut defs = Vec::new();
         for tool in self.tools.values() {

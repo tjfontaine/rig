@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::RwLock;
+use crate::wasm_compat::WasmRwLock as RwLock;
 
 use crate::{
     completion::{CompletionModel, Document},

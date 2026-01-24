@@ -108,15 +108,17 @@
 //! ```
 mod builder;
 mod completion;
-pub(crate) mod prompt_request;
+pub mod prompt_request;
 mod tool;
 
 pub use crate::message::Text;
 pub use builder::{AgentBuilder, AgentBuilderSimple};
 pub use completion::Agent;
 pub use prompt_request::hooks::{HookAction, PromptHook, ToolCallHookAction};
+#[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+pub use prompt_request::streaming::for_each_blocking;
 pub use prompt_request::streaming::{
-    FinalResponse, MultiTurnStreamItem, StreamingError, StreamingPromptRequest, StreamingResult,
-    stream_to_stdout,
+    stream_to_stdout, FinalResponse, MultiTurnStreamItem, StreamingError, StreamingPromptRequest,
+    StreamingResult,
 };
 pub use prompt_request::{PromptRequest, PromptResponse};

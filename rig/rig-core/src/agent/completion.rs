@@ -9,11 +9,10 @@ use crate::{
     streaming::{StreamingChat, StreamingCompletion, StreamingPrompt},
     tool::server::ToolServerHandle,
     vector_store::{VectorStoreError, request::VectorSearchRequest},
-    wasm_compat::WasmCompatSend,
+    wasm_compat::{WasmCompatSend, WasmRwLock as RwLock},
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
 
 const UNKNOWN_AGENT_NAME: &str = "Unnamed Agent";
 

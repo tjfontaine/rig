@@ -144,6 +144,40 @@ pub use one_or_many::{EmptyListError, OneOrMany};
 
 #[cfg(feature = "derive")]
 #[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
-pub use rig_derive::{Embed, rig_tool as tool_macro};
+pub use rig_derive::{rig_tool as tool_macro, Embed};
 
 pub mod telemetry;
+
+// ============================================================================
+// Spawn abstraction for async task execution
+// ============================================================================
+// Routes to the appropriate runtime based on feature flags:
+// - wasip2: wit-bindgen::spawn (WASI component model)
+// - wasm: wasm-bindgen-futures::spawn_local (browser WASM)
+// - native: tokio::spawn (default with tokio)
+
+use std::future::Future;
+
+/// Spawn a future for concurrent execution.
+///
+/// This function abstracts over different async runtimes:
+/// - In WASIP2 environments, uses wit-bindgen's native async support
+/// - In browser WASM, uses wasm-bindgen-futures
+/// - In native environments, uses tokio
+#[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+pub fn spawn<F: Future<Output = ()> + 'static>(f: F) {
+    wit_bindgen::spawn(f);
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32", not(feature = "wasip2")))]
+pub fn spawn<F: Future<Output = ()> + 'static>(f: F) {
+    wasm_bindgen_futures::spawn_local(f);
+}
+
+#[cfg(not(any(
+    all(feature = "wasm", target_arch = "wasm32"),
+    all(feature = "wasip2", target_arch = "wasm32")
+)))]
+pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) {
+    tokio::spawn(f);
+}

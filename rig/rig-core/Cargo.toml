@@ -60,6 +60,12 @@ reqwest-middleware = { version = "0.4.2", optional = true, features = [
   "http2",
 ] }
 
+# WASIP2 async support (component model)
+wit-bindgen = { version = "0.50", features = [
+  "async",
+  "async-spawn",
+], optional = true }
+
 [dev-dependencies]
 anyhow = { workspace = true }
 assert_fs = { workspace = true }
@@ -118,6 +124,9 @@ reqwest-middleware-rustls = [
   "reqwest-middleware",
   "reqwest-middleware/rustls-tls",
 ]
+
+# WASIP2 component model support (uses wit-bindgen for async)
+wasip2 = ["dep:wit-bindgen"]
 
 [[test]]
 name = "embed_macro"

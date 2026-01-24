@@ -241,3 +241,53 @@ impl<T> WasmRwLock<T> {
         self.inner.write().expect("RwLock poisoned")
     }
 }
+
+// ============================================================================
+// WASM-compatible yield/sleep
+// ============================================================================
+//
+// PROBLEM: `std::thread::sleep` panics in WASIP2/WASM environments because
+// thread parking/sleeping is not implemented.
+//
+// SOLUTION: For WASIP2, we use the WASI monotonic-clock's `subscribe_duration`
+// to create a pollable that we can block on. This properly yields to the host
+// event loop (JSPI in browsers) without panicking.
+//
+// For browser WASM (non-WASIP2), we have no good option - the function becomes
+// a no-op since we can't block in browser WASM anyway.
+
+/// Yield to the host event loop for a short duration.
+///
+/// This is used in polling loops where we hit `Poll::Pending` and need to yield
+/// to avoid busy-looping.
+///
+/// In WASIP2, this uses the WASI monotonic-clock's `subscribe_duration` to create
+/// a pollable that the host can suspend on. When running under JSPI, this allows
+/// proper async suspension without panicking.
+#[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+pub fn wasm_yield(millis: u64) {
+    use ::wasip2::clocks::monotonic_clock;
+    use ::wasip2::io::poll;
+
+    // Convert milliseconds to nanoseconds
+    let duration_nanos = millis * 1_000_000;
+
+    // Create a pollable that will resolve after the duration
+    let pollable = monotonic_clock::subscribe_duration(duration_nanos);
+
+    // Block on the pollable, which allows JSPI to suspend the stack
+    poll::poll(&[&pollable]);
+}
+
+/// Yield for browser WASM (no-op since we can't block)
+#[cfg(all(feature = "wasm", target_arch = "wasm32", not(feature = "wasip2")))]
+pub fn wasm_yield(_millis: u64) {
+    // In browser WASM without WASIP2, we cannot block.
+    // This is a no-op - the caller should handle this gracefully.
+}
+
+/// Native: use std::thread::sleep
+#[cfg(not(target_arch = "wasm32"))]
+pub fn wasm_yield(millis: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(millis));
+}

@@ -8,9 +8,8 @@
 //! - [StreamingCompletion]: Defines a low-level streaming LLM completion interface
 //!
 
-use crate::OneOrMany;
-use crate::agent::Agent;
 use crate::agent::prompt_request::streaming::StreamingPromptRequest;
+use crate::agent::Agent;
 use crate::client::FinalCompletionResponse;
 use crate::completion::{
     CompletionError, CompletionModel, CompletionRequestBuilder, CompletionResponse, GetTokenUsage,
@@ -18,6 +17,7 @@ use crate::completion::{
 };
 use crate::message::{AssistantContent, Reasoning, Text, ToolCall, ToolFunction, ToolResult};
 use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
+use crate::OneOrMany;
 use futures::stream::{AbortHandle, Abortable};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -25,14 +25,27 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::task::{Context, Poll};
+// Native: use tokio watch channel for pause control
+#[cfg(not(any(
+    all(feature = "wasm", target_arch = "wasm32"),
+    all(feature = "wasip2", target_arch = "wasm32")
+)))]
 use tokio::sync::watch;
 
 /// Control for pausing and resuming a streaming response
+#[cfg(not(any(
+    all(feature = "wasm", target_arch = "wasm32"),
+    all(feature = "wasip2", target_arch = "wasm32")
+)))]
 pub struct PauseControl {
     pub(crate) paused_tx: watch::Sender<bool>,
     pub(crate) paused_rx: watch::Receiver<bool>,
 }
 
+#[cfg(not(any(
+    all(feature = "wasm", target_arch = "wasm32"),
+    all(feature = "wasip2", target_arch = "wasm32")
+)))]
 impl PauseControl {
     pub fn new() -> Self {
         let (paused_tx, paused_rx) = watch::channel(false);
@@ -55,6 +68,54 @@ impl PauseControl {
     }
 }
 
+#[cfg(not(any(
+    all(feature = "wasm", target_arch = "wasm32"),
+    all(feature = "wasip2", target_arch = "wasm32")
+)))]
+impl Default for PauseControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// WASM/WASIP2: use AtomicBool for pause control (no tokio runtime needed)
+#[cfg(any(
+    all(feature = "wasm", target_arch = "wasm32"),
+    all(feature = "wasip2", target_arch = "wasm32")
+))]
+pub struct PauseControl {
+    paused: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(
+    all(feature = "wasm", target_arch = "wasm32"),
+    all(feature = "wasip2", target_arch = "wasm32")
+))]
+impl PauseControl {
+    pub fn new() -> Self {
+        Self {
+            paused: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.paused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(any(
+    all(feature = "wasm", target_arch = "wasm32"),
+    all(feature = "wasip2", target_arch = "wasm32")
+))]
 impl Default for PauseControl {
     fn default() -> Self {
         Self::new()
@@ -244,6 +305,53 @@ where
 
     pub fn is_paused(&self) -> bool {
         self.pause_control.is_paused()
+    }
+
+    /// Blocking iteration for WASIP2 environments.
+    ///
+    /// This method iterates over the stream synchronously, calling the provided
+    /// callback for each item. In WASIP2/JSPI environments, when the underlying
+    /// HTTP stream calls `blocking_read`, the WASM stack is suspended by JSPI
+    /// and control returns to the JavaScript event loop.
+    ///
+    /// This is the preferred way to consume streams in WASIP2 environments
+    /// where async executors like tokio are not available.
+    #[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+    pub fn for_each_blocking<F>(&mut self, mut f: F) -> Result<(), CompletionError>
+    where
+        F: FnMut(StreamedAssistantContent<R>),
+    {
+        use std::task::Poll;
+
+        // Create a no-op waker - JSPI handles the actual suspension
+        // when blocking_read is called in the underlying HTTP stream
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        loop {
+            match Pin::new(&mut *self).poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(item))) => {
+                    f(item);
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Err(e);
+                }
+                Poll::Ready(None) => {
+                    return Ok(());
+                }
+                Poll::Pending => {
+                    // In WASIP2 with JSPI, Poll::Pending shouldn't occur
+                    // during normal streaming because blocking_read suspends
+                    // the WASM stack. If we do get Pending (e.g., from pause control
+                    // or internal flow control), we MUST yield to the host event loop
+                    // to prevent a busy loop (spin loop) which locks up the browser.
+                    //
+                    // Use wasm_yield for cross-platform compatibility (avoids panic in WASM).
+                    crate::wasm_compat::wasm_yield(10);
+                    continue;
+                }
+            }
+        }
     }
 }
 

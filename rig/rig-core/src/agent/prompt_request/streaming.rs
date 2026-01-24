@@ -1,16 +1,15 @@
 use crate::{
-    OneOrMany,
-    agent::prompt_request::{HookAction, hooks::PromptHook},
+    agent::prompt_request::{hooks::PromptHook, HookAction},
     completion::GetTokenUsage,
     json_utils,
     message::{AssistantContent, Reasoning, ToolResult, ToolResultContent, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingCompletion},
-    wasm_compat::{WasmBoxedFuture, WasmCompatSend},
+    wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmRwLock as RwLock},
+    OneOrMany,
 };
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{pin::Pin, sync::Arc};
-use tokio::sync::RwLock;
 use tracing::info_span;
 use tracing_futures::Instrument;
 
@@ -551,16 +550,70 @@ pub async fn stream_to_stdout<R>(
     Ok(final_res)
 }
 
+/// Blocking iteration for WASIP2 environments.
+///
+/// This function iterates over a `StreamingResult` synchronously, calling the provided
+/// callback for each item. In WASIP2/JSPI environments, when the underlying
+/// HTTP stream calls `blocking_read`, the WASM stack is suspended by JSPI
+/// and control returns to the JavaScript event loop.
+///
+/// This is the preferred way to consume streams in WASIP2 environments
+/// where async executors like tokio are not available.
+#[cfg(all(feature = "wasip2", target_arch = "wasm32"))]
+pub fn for_each_blocking<R, F>(
+    stream: &mut StreamingResult<R>,
+    mut f: F,
+) -> Result<FinalResponse, StreamingError>
+where
+    R: Clone + Unpin,
+    F: FnMut(&MultiTurnStreamItem<R>),
+{
+    use std::task::Poll;
+
+    // Create a no-op waker - JSPI handles the actual suspension
+    // when blocking_read is called in the underlying HTTP stream
+    let waker = futures::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+
+    let mut final_response = FinalResponse::empty();
+
+    loop {
+        match stream.as_mut().poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(item))) => {
+                if let MultiTurnStreamItem::FinalResponse(ref res) = item {
+                    final_response = res.clone();
+                }
+                f(&item);
+            }
+            Poll::Ready(Some(Err(e))) => {
+                return Err(e);
+            }
+            Poll::Ready(None) => {
+                return Ok(final_response);
+            }
+            Poll::Pending => {
+                // In WASIP2 with JSPI, Poll::Pending shouldn't occur
+                // during normal streaming because blocking_read suspends
+                // the WASM stack. If we do get Pending, continue polling.
+                //
+                // Use wasm_yield for cross-platform compatibility (avoids panic in WASM).
+                crate::wasm_compat::wasm_yield(10);
+                continue;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::ProviderClient;
     use crate::client::completion::CompletionClient;
+    use crate::client::ProviderClient;
     use crate::providers::anthropic;
     use crate::streaming::StreamingPrompt;
     use futures::StreamExt;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Background task that logs periodically to detect span leakage.

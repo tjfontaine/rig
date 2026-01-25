@@ -111,7 +111,6 @@ discord-bot = ["dep:serenity"]
 pdf = ["dep:lopdf"]
 epub = ["dep:epub", "dep:quick-xml"]
 rayon = ["dep:rayon"]
-wasm = ["dep:wasm-bindgen-futures", "futures-timer/wasm-bindgen", "getrandom/js"]
 rmcp = ["dep:rmcp"]
 socks = ["reqwest/socks"]
 reqwest-tls = ["reqwest/default"]
@@ -128,7 +127,16 @@ reqwest-middleware-rustls = [
   "reqwest-middleware/rustls-tls",
 ]
 
+# WASM support - relaxes Send/Sync bounds for single-threaded WASM.
+# Does NOT enable browser timers - use wasm-browser-timers for that.
+wasm = ["dep:wasm-bindgen-futures"]
+
+# Browser WASM timers - only enable for browser WASM, NOT for WASIP2!
+# This enables futures-timer/wasm-bindgen which requires browser JS interop.
+wasm-browser-timers = ["futures-timer/wasm-bindgen"]
+
 # WASIP2 component model support (uses wit-bindgen for async)
+# Compatible with "wasm" feature for relaxed Send bounds, but NOT with wasm-browser-timers
 wasip2 = ["dep:wit-bindgen", "dep:wasip2"]
 
 [[test]]

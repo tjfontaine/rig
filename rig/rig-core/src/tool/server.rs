@@ -120,12 +120,18 @@ impl ToolServer {
         use crate::wasm_compat::WasmRwLock;
         use std::sync::Arc;
 
+        // At this point `self` is consumed and `toolset` is private, so there should be
+        // no other strong references to the Arc.
+        let toolset = Arc::try_unwrap(self.toolset)
+            .expect("ToolServer::run() called with shared toolset")
+            .into_inner();
+
         // For WASIP2, store the toolset directly in the handle
         // This avoids the channel+spawn pattern that doesn't work with JSPI
         let inner = WasipToolServerInner {
             static_tool_names: self.static_tool_names,
             dynamic_tools: self.dynamic_tools,
-            toolset: self.toolset,
+            toolset,
         };
 
         ToolServerHandle {

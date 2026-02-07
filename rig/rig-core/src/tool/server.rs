@@ -122,9 +122,10 @@ impl ToolServer {
 
         // At this point `self` is consumed and `toolset` is private, so there should be
         // no other strong references to the Arc.
-        let toolset = Arc::try_unwrap(self.toolset)
-            .expect("ToolServer::run() called with shared toolset")
-            .into_inner();
+        let toolset = match Arc::try_unwrap(self.toolset) {
+            Ok(lock) => lock.into_inner(),
+            Err(_) => panic!("ToolServer::run() called with shared toolset"),
+        };
 
         // For WASIP2, store the toolset directly in the handle
         // This avoids the channel+spawn pattern that doesn't work with JSPI
